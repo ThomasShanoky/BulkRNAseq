@@ -1,5 +1,5 @@
 ---
-title: "Cas Pratique Genosplice : Analyse bulk RNA-seq"
+title: "Cas Pratique : Analyse bulk RNA-seq"
 author: "Thomas Louvet"
 date: "Juillet 2025"
 output: pdf_document
