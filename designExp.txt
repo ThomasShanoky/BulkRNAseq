@@ -1,0 +1,7 @@
+experiment	condition
+HCT116_ctrl1	C
+HCT116_ctrl2	C
+HCT116_ctrl3	C
+HCT116_curcumin1	E
+HCT116_curcumin2	E
+HCT116_curcumin3	E

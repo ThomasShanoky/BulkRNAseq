@@ -1,0 +1,281 @@
+---
+title: "Cas Pratique Genosplice : Analyse bulk RNA-seq"
+author: "Thomas Louvet"
+date: "Juillet 2025"
+output: pdf_document
+---
+
+# Analyse de données Bulk RNA-seq
+
+## Etapes préliminaires : alignement et comptage
+
+```{bash eval=FALSE}
+#Téléchargement des Fastq
+for SRR in SRR24153667 SRR24153668 SRR24153669 SRR24153670 SRR24153671 SRR24153666
+do
+      fasterq-dump $SRR --split-files -p
+      pigz ${SRR}_1.fastq ${SRR}_2.fastq
+done
+```
+
+Liens du génome de référence + annotation :
+
+-   <ftp://ftp.ensembl.org/pub/release-114/fasta/homo_sapiens/dna/Homo_sapiens.GRCh38.dna.primary_assembly.fa.gz>
+
+-   <ftp://ftp.ensembl.org/pub/release-114/gtf/homo_sapiens/Homo_sapiens.GRCh38.114.gtf.gz>
+
+```{bash eval=FALSE}
+#Dans le dossier contenant les fastq
+fastqc *.fastq.gz
+```
+
+Problèmes dans les fastq :
+
+-   Proportions de nucléotides pas équilibrés au début des reads (10 premiers) =\> Amorces/adaptateurs restants
+
+-   Généralement 35% des reads se retrouvent plusieurs fois =\> courant et acceptable (gènes très exprimés produisant beaucoup de reads)
+
+=\> On doit trim les reads
+
+```{bash eval=FALSE}
+#Pour un échantillon
+cutadapt -u 10 -U 10 -o HCT116_curcumin_trimmed_03_R1.fastq.gz -p HCT116_curcumin_trimmed_03_R2.fastq.gz HCT116_curcumin_03_R1.fastq.gz HCT116_curcumin_03_R2.fastq.gz
+```
+
+```{bash eval=FALSE}
+#Création de l'index STAR
+STAR 
+    --runThreadN 32 
+    --runMode genomeGenerate 
+    --genomeDir ~/RNAseq/STARindex/ 
+    --genomeFastaFiles ~/RNAseq/genome/Homo_sapiens.GRCh38.dna.primary_assembly.fa        
+    --sjdbGTFfile ~/RNAseq/genome/Homo_sapiens.GRCh38.114.gtf 
+    --sjdbOverhang 139 #139 = 150 - 10 (trim) - 1
+```
+
+Pour voir la longueur des reads :
+
+```{bash eval=FALSE}
+zcat HCT116_curcumin_trimmed_01_R1.fastq.gz | head -n 1000 | awk 'NR % 4 == 2 {print length($1)}' | sort | uniq -c
+#250 140 => Pour les 250 premiers reads, tous ont une longueur de 150 nucléotides
+```
+
+Ou bien voir le graphe Sequence Length Distribution dans les résultats des FastQC (et enlever -1 et le nombre de nucléotides enlevé au début des reads avec cutadapt)
+
+```{bash eval=FALSE}
+#Alignement : dans le dossier /fastq/ contenant les fastq
+for sample in HCT116_ctrl_trimmed_01 HCT116_ctrl_trimmed_02 HCT116_ctrl_trimmed_03 HCT116_curcumin_trimmed_01 HCT116_curcumin_trimmed_02 HCT116_curcumin_trimmed_03
+do
+  STAR --runThreadN 32
+       --genomeDir ~/RNAseq/STARindex
+       --readFilesIn ${sample}_R1.fastq.gz ${sample}_R2.fastq.gz
+       --readFilesCommand zcat
+       --outFileNamePrefix ~/RNAseq/alignments/${sample}_
+       --outSAMtype BAM SortedByCoordinate
+done
+```
+
+```{bash eval=FALSE}
+#Comptage des reads alignés sur les gènes : dans le dossier contenant les alignements /alignments/
+featureCounts -T 16 -p -a ~/RNAseq/genome/Homo_sapiens.GRCh38.114.gtf -o ~/RNAseq/counts/gene_counts.txt HCT116_ctrl1.bam HCT116_ctrl2.bam HCT116_ctrl3.bam HCT116_curcumin1.bam HCT116_curcumin2.bam HCT116_curcumin3.bam
+```
+
+Formater le fichier obtenu avec preprocessingCounts.R
+
+```{r}
+library(dplyr)
+library(DESeq2)
+library(limma)
+library(edgeR)
+library(ggplot2)
+library(EnhancedVolcano)
+library(biomaRt)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+```
+
+```{r}
+counts <- read.table("/home/thomas.louvet/Documents/Rfiles/gene_counts.txt", row.names = 1, header = TRUE)
+
+colExp <- read.table("/home/thomas.louvet/Documents/Rfiles/designExp.txt", row.names = 1, header = TRUE)
+```
+
+## Analyse Différentielle
+
+```{r}
+dds <- DESeqDataSetFromMatrix(countData = counts, colData = colExp, design = ~condition)
+
+keep <- rowSums(counts(dds) >= 10) >= 2 #au moins 10 lecturess dans 2 échantillons
+dds <- dds[keep, ]
+cat(sum(!keep), "gènes faiblement exprimés supprimés")
+```
+
+```{r}
+barplot(colSums(counts(dds)), main = "Total des comptages de reads par échantillon")
+
+dds <- estimateSizeFactors(dds)
+
+sizeFactors(dds)
+
+norm_counts <- counts(dds, normalized=TRUE)
+barplot(colSums(norm_counts), main = "Total des comptages normalisés des reads par échantillon")
+```
+
+```{r}
+dds <- estimateDispersions(dds)
+
+#png("/home/thomas.louvet/Documents/Rfiles/Results/DispersionGraph.png", width = 800, height = 600)
+plotDispEsts(dds)
+title("Estimation de la dispersion des gènes par DESeq2")
+#dev.off()
+```
+
+```{r}
+dds <- nbinomWaldTest(dds)
+```
+
+```{r}
+res <- results(dds, contrast=c("condition","C","E"), alpha=0.05)
+head(res)
+
+summary(res)
+
+sum(res$padj < 0.05, na.rm=TRUE)
+```
+
+```{r}
+res <- as.data.frame(res)
+```
+
+```{r}
+#png("/home/thomas.louvet/Documents/Rfiles/Results/PvaluesDistribution.png", width = 800, height = 400)
+ggplot(res, aes(x = pvalue)) +
+  geom_histogram(bins = 100) + 
+  ggtitle(label = "P-value distibution") +
+  theme(plot.title = element_text(hjust = 0.5))
+#dev.off()
+```
+
+```{r}
+logFCthreshold <- 2
+adjPVthreshold <- 0.01
+
+png("/home/thomas.louvet/Documents/Rfiles/Results/VolcanoPlot.png", width = 800, height = 600)
+EnhancedVolcano(res,
+	lab = rownames(res),
+	x = 'log2FoldChange',
+	y = 'padj',
+	axisLabSize = 12,
+	ylim = c(0,max(-log10(res[[6]]))),
+	caption = paste0(nrow(res), " total genes"),
+	captionLabSize = 12,
+	FCcutoff = logFCthreshold,
+	pCutoff = adjPVthreshold,
+	title = 'Control vs Curcimine',
+	subtitle = 'Volcano plot',
+	pointSize = 2.0,
+	labSize = 4.0,
+	legendLabSize = 12,
+	legendIconSize = 2.0,
+	drawConnectors = TRUE)
+dev.off()
+```
+
+```{r}
+cat("Nombre de gène considéré : ", nrow(res))
+print("\n")
+cat("Nombre de gènes ayant une différence d'expression significative entre les deux conditions : ", sum(res$padj<0.01 & abs(res$log2FoldChange)>2))
+print("\n")
+cat("Nombre de gènes surexprimés : ", sum(res$padj<0.01 & res$log2FoldChange>=2))
+print("\n")
+cat("Nombre de gènes sous-exprimés : ", sum(res$padj<0.01 & res$log2FoldChange<=-2))
+```
+
+```{r}
+res_clean <- res[!is.na(res$padj), ]
+res_sig <- res_clean[res_clean$padj < 0.01, ]
+res_sig$absLog2FC <- abs(res_sig$log2FoldChange)
+res_ranked <- res_sig[order(res_sig$padj, -res_sig$absLog2FC), ]
+top_genes <- head(res_ranked, 500)
+top_genes <- top_genes[order(top_genes$absLog2FC, decreasing = TRUE), ]
+
+
+gene_symbols <- rownames(top_genes)
+conversion <- bitr(
+  gene_symbols,
+  fromType = "ENSEMBL",
+  toType = "SYMBOL",
+  OrgDb = org.Hs.eg.db
+)
+
+top_genes$ENSEMBL <- rownames(top_genes)
+top_genes <- merge(top_genes, conversion, by = "ENSEMBL", all.x = TRUE)
+top_genes$ENSEMBL <- top_genes$hgnc_symbol
+top_genes$hgnc_symbol <- NULL
+colnames(top_genes)[colnames(top_genes) == "ENSEMBL"] <- "gene"
+top_genes <- top_genes[order(-top_genes$absLog2FC), ]
+
+write.csv(top_genes,
+          "/home/thomas.louvet/Documents/Rfiles/Results/top50_most_significant_DEGs.csv",
+          row.names = FALSE)
+```
+
+## Analyse d'enrichissement
+
+```{r}
+gene_up_reg <- top_genes$SYMBOL[top_genes$log2FoldChange>0]
+gene_down_reg <- top_genes$SYMBOL[top_genes$log2FoldChange<0]
+
+gene_up_entrez <- bitr(gene_up_reg,
+                    fromType = "SYMBOL",
+                    toType = "ENTREZID",
+                    OrgDb = org.Hs.eg.db)
+
+gene_down_entrez <- bitr(gene_down_reg,
+                    fromType = "SYMBOL",
+                    toType = "ENTREZID",
+                    OrgDb = org.Hs.eg.db)
+
+gene_up_list <- gene_up_entrez$ENTREZID
+gene_down_list <- gene_down_entrez$ENTREZID
+
+length(gene_down_list)
+length(gene_up_list)
+```
+
+```{r}
+ego_up_bp <- enrichGO(gene      = gene_up_list,
+                   OrgDb        = org.Hs.eg.db,
+                   keyType      = "ENTREZID",
+                   ont          = "BP", #Biological Process
+                   pAdjustMethod= "BH",
+                   pvalueCutoff = 0.05,
+                   qvalueCutoff = 0.05,
+                   readable     = TRUE)
+
+write.csv(as.data.frame(ego_up_bp), "/home/thomas.louvet/Documents/Rfiles/Results/GO_upreg_enrichment_BP.csv")
+nrow(as.data.frame(ego_up_bp))
+
+
+ego_down_bp <- enrichGO(gene    = gene_down_list,
+                   OrgDb        = org.Hs.eg.db,
+                   keyType      = "ENTREZID",
+                   ont          = "BP",
+                   pAdjustMethod= "BH",
+                   pvalueCutoff = 0.05,
+                   qvalueCutoff = 0.05,
+                   readable     = TRUE)
+
+write.csv(as.data.frame(ego_down_bp), "/home/thomas.louvet/Documents/Rfiles/Results/GO_downreg_enrichment_BP.csv")
+nrow(as.data.frame(ego_down_bp))
+```
+
+```{r fig.width=16, fig.height=14}
+png("/home/thomas.louvet/Documents/Rfiles/Results/GO_upreg_BP_barplot.png", width = 700, height = 600)
+barplot(ego_up_bp, showCategory=10, title="Analyse d'enrichissement des processus biologiques des gènes surexprimés dans la\ncondition traitement à la curcumine (Gene Ontology)")
+dev.off()
+
+png("/home/thomas.louvet/Documents/Rfiles/Results/GO_downreg_BP_barplot.png", width = 700, height = 600)
+barplot(ego_down_bp, showCategory=10, title="Analyse d'enrichissement des processus biologiques des gènes sous-exprimés dans la\ncondition traitement à la curcumine (Gene Ontology)")
+dev.off()
+```
